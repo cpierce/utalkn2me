@@ -1,4 +1,4 @@
-.PHONY: help build up up-api down restart logs logs-worker logs-api logs-pusher ps sh-worker sh-api sh-pusher stats sync last wipe
+.PHONY: help build up up-api down down-api restart logs logs-worker logs-api logs-pusher ps sh-worker sh-api sh-pusher stats sync last wipe
 
 # Default to `op run` so 1Password resolves op:// refs in .env on the host.
 # Override with `OP= make up` if you want to pass plain values yourself.
@@ -11,6 +11,7 @@ help:
 	@echo "  make up          build + start worker + pusher (API off)"
 	@echo "  make up-api      build + start worker + pusher + local read-only API"
 	@echo "  make down        stop and remove all containers"
+	@echo "  make down-api    stop just the API container (worker + pusher keep running)"
 	@echo "  make restart     down + up"
 	@echo "  make logs        follow logs from all running services"
 	@echo "  make logs-worker follow worker logs"
@@ -36,6 +37,9 @@ up-api:
 
 down:
 	docker compose --profile api down
+
+down-api:
+	docker compose stop api && docker compose rm -f api
 
 restart: down up
 
