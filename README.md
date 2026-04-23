@@ -79,40 +79,61 @@ GPU. `faster-whisper` is ~3× quicker on CPU.
 
 ## Docker
 
-Two services share a `./data` volume:
+Three services share a `./data` volume:
 
-- **worker** — runs `sync --transcribe` every 5 minutes in a loop
-- **api**    — Flask + gunicorn REST API on port 8000
+- **worker** — pulls the call log every 5 min, transcribes new recordings.
+  No network ports.
+- **pusher** — reads unpushed rows from SQLite and POSTs them to your
+  webhook (`PUSH_URL`). No network ports. Idles if `PUSH_URL` is unset.
+- **api** — *optional* read-only Flask API over the local SQLite DB.
+  Off by default (opt-in via the `api` profile). Binds to `127.0.0.1` only.
 
 Use the Makefile (wraps `op run` so 1P refs in `.env` resolve on the host):
 
 ```sh
 cp .env.example .env   # edit
-make up                # build + start both services
-make logs              # tail logs
-make stats             # GET /stats via the running API
+
+make up                # worker + pusher (no exposed ports at all)
+make up-api            # worker + pusher + local API on 127.0.0.1:${API_PORT}
+
+make logs              # tail logs from running services
 make sync              # run one sync cycle in a throwaway container
-make down              # stop
+make down              # stop everything
 ```
 
-Or the raw commands:
+Or raw compose:
 
 ```sh
-op run --env-file .env -- docker compose up -d --build
-docker compose logs -f
+op run --env-file .env -- docker compose up -d --build                 # no API
+op run --env-file .env -- docker compose --profile api up -d --build   # with API
 ```
 
-What the container does:
+What the stack does:
 
 - Pulls the call log every 5 minutes (`--loop 300`).
 - Writes calls to `/data/calls.db` (SQLite).
-- Saves MP3s to `/data/recordings/<uuid>.mp3`.
-- Transcribes new recordings with `faster-whisper` (`tiny` model by default).
+- Saves MP3s to `/data/recordings/<uuid>.mp3` (auto-pruned after 30 days).
+- Transcribes new recordings with `faster-whisper` (`large-v3` by default).
 - Persists session cookies to `/data/session.json` so MFA isn't needed after
   the first successful login.
+- Pushes everything to your webhook if `PUSH_URL` is configured.
 
 `./data` on the host is the single source of truth — back that up and you
 have every call, every recording, every transcript.
+
+### Expose the local API on your LAN
+
+Local API is `127.0.0.1`-only by default. To open it up:
+
+```
+# in .env
+API_BIND=0.0.0.0
+API_PORT=8000
+```
+
+Then `make up-api`. Put it behind auth (reverse proxy, Tailscale, or
+similar) before exposing it publicly — the API has no built-in
+authentication.
 
 ### Change the whisper model / polling interval
 
