@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.csv
+*.json
+!*.example
+data/
+recordings/
+transcripts/

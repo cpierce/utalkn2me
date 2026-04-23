@@ -1,0 +1,30 @@
+services:
+  worker:
+    build: .
+    container_name: utalkn2me-worker
+    restart: unless-stopped
+    environment:
+      UNIFI_HOST:  ${UNIFI_HOST:-https://192.168.1.1}
+      UNIFI_USER:  ${UNIFI_USER}
+      UNIFI_PASS:  ${UNIFI_PASS}
+      UNIFI_TOTP:  ${UNIFI_TOTP:-}
+      WHISPER_BACKEND: ${WHISPER_BACKEND:-faster-whisper}
+      WHISPER_MODEL:   ${WHISPER_MODEL:-tiny}
+    volumes:
+      - ./data:/data
+    # entrypoint + default CMD from Dockerfile run the sync loop
+
+  api:
+    build: .
+    container_name: utalkn2me-api
+    restart: unless-stopped
+    entrypoint: ["gunicorn", "-b", "0.0.0.0:8000", "--workers", "2", "api:app"]
+    environment:
+      SQLITE_PATH:    /data/calls.db
+      RECORDINGS_DIR: /data/recordings
+    volumes:
+      - ./data:/data
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      - worker
