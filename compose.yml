@@ -8,17 +8,37 @@ services:
       UNIFI_USER:  ${UNIFI_USER}
       UNIFI_PASS:  ${UNIFI_PASS}
       UNIFI_TOTP:  ${UNIFI_TOTP:-}
-      WHISPER_BACKEND: ${WHISPER_BACKEND:-faster-whisper}
-      WHISPER_MODEL:   ${WHISPER_MODEL:-tiny}
+      WHISPER_BACKEND:  ${WHISPER_BACKEND:-faster-whisper}
+      WHISPER_MODEL:    ${WHISPER_MODEL:-large-v3}
+      TRANSCRIPT_CLEAN: ${TRANSCRIPT_CLEAN:-1}
+      PRUNE_RECORDINGS_DAYS: ${PRUNE_RECORDINGS_DAYS:-30}
     volumes:
       - ./data:/data
     # entrypoint + default CMD from Dockerfile run the sync loop
+
+  pusher:
+    build: .
+    container_name: utalkn2me-pusher
+    restart: unless-stopped
+    entrypoint: ["python", "push.py"]
+    environment:
+      SQLITE_PATH:    /data/calls.db
+      PUSH_URL:       ${PUSH_URL:-}
+      PUSH_TOKEN:     ${PUSH_TOKEN:-}
+      PUSH_SITE_ID:   ${PUSH_SITE_ID:-}
+      PUSH_BATCH:     ${PUSH_BATCH:-10}
+      PUSH_INTERVAL:  ${PUSH_INTERVAL:-5}
+      PUSH_TIMEOUT:   ${PUSH_TIMEOUT:-30}
+    volumes:
+      - ./data:/data
+    depends_on:
+      - worker
 
   api:
     build: .
     container_name: utalkn2me-api
     restart: unless-stopped
-    entrypoint: ["gunicorn", "-b", "0.0.0.0:8000", "--workers", "2", "api:app"]
+    entrypoint: ["gunicorn", "-b", "0.0.0.0:8000", "--workers", "1", "--timeout", "120", "api:app"]
     environment:
       SQLITE_PATH:    /data/calls.db
       RECORDINGS_DIR: /data/recordings

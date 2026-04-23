@@ -250,3 +250,170 @@ op run --env-file .env -- python unifi_talk.py sync            # fetch-only, no 
 op run --env-file .env -- python unifi_talk.py sync --transcribe
 op run --env-file .env -- python unifi_talk.py info            # controller info
 ```
+
+---
+
+## Recording retention
+
+MP3s accumulate — about 20 MB per hour of recorded audio. The sync loop
+deletes MP3s for calls older than `PRUNE_RECORDINGS_DAYS` (default **30**).
+Transcripts and call metadata stay forever; only the audio file is removed.
+
+Set `PRUNE_RECORDINGS_DAYS=0` to disable pruning entirely.
+
+---
+
+## Pushing data to your own backend
+
+`utalkn2me` is the local producer. It collects calls and transcripts into
+SQLite. A third container service — **pusher** — reads unsent rows from
+that local DB and POSTs them to a webhook **you operate**. That's where
+you write your own receiver and persist to MySQL, Postgres, DynamoDB,
+whatever makes sense for you.
+
+```
+[UniFi controller] → [utalkn2me worker] → [SQLite outbox] → [pusher] → [YOUR /ingest webhook] → [your DB]
+```
+
+### Config
+
+In `.env`:
+
+```
+PUSH_URL=https://api.yourcompany.com/ingest/utalkn2me
+PUSH_TOKEN=op://Private/utalkn2me-webhook/secret
+PUSH_SITE_ID=home-office-01
+PUSH_BATCH=10          # rows per HTTP request
+PUSH_INTERVAL=5        # seconds between batches
+PUSH_TIMEOUT=30
+```
+
+Leave `PUSH_URL` empty to run in local-only mode (pusher idles, everything
+else still works — use the REST API or query SQLite directly).
+
+### Payload contract
+
+Every row is delivered as a single JSON POST. Two event types:
+
+**`call.upserted`** — sent when a new call appears, resent when the row
+changes (e.g., a late transcript arrives on a Pro-plan install in the future):
+
+```json
+{
+  "schema_version": 1,
+  "event": "call.upserted",
+  "site_id": "home-office-01",
+  "uuid": "00000000-0000-0000-0000-000000000001",
+  "time": "2026-04-22T16:30:51.300Z",
+  "direction": "in",
+  "from": "+15555550123",
+  "to":   "+15555550199",
+  "from_caller_name": "EXAMPLE CALLER",
+  "answered_by": "0008",
+  "status": "accepted",
+  "duration": 132,
+  "is_video_call": false,
+  "recording_available": true,
+  "recording_filename": "20260422_113120_15555550123_101_abcdef.mp3",
+  "quality_score": 100,
+  "to_smart_attendant_title": "Front Desk",
+  "first_seen": "2026-04-22 16:31:05",
+  "transcript": {
+    "text": "Thanks for calling — how can I help?…",
+    "source": "faster-whisper",
+    "model": "large-v3",
+    "created_at": "2026-04-22 16:31:40"
+  },
+  "raw": {
+    "…the complete original Talk API record, including call_events timeline…"
+  }
+}
+```
+
+**`transcript.upserted`** — sent when a transcript is produced for a call
+that was already pushed earlier. Small, targeted update:
+
+```json
+{
+  "schema_version": 1,
+  "event": "transcript.upserted",
+  "site_id": "home-office-01",
+  "uuid": "00000000-0000-0000-0000-000000000001",
+  "call_time": "2026-04-22T16:30:51.300Z",
+  "transcript": {
+    "text": "…",
+    "source": "faster-whisper",
+    "model": "large-v3",
+    "created_at": "2026-04-22 16:31:40"
+  }
+}
+```
+
+### Guarantees
+
+- **Idempotent** — every payload has a stable `uuid`. Upsert by it. Retries
+  are safe.
+- **At-least-once** — a 5xx or network failure retries indefinitely until it
+  acks. Your receiver may see the same `uuid` twice.
+- **In order per-uuid** — a `call.upserted` for a uuid always precedes any
+  `transcript.upserted` for the same uuid (because the call row exists
+  before the transcript does).
+- **Eventually consistent** — during downtime the outbox just grows; when
+  the endpoint comes back, everything catches up within `PUSH_BATCH /
+  PUSH_INTERVAL` per second.
+- **4xx = permanent** — malformed payloads, auth failures, etc. are not
+  retried. The row gets marked as pushed with `push_error` set, and you
+  look in SQLite to debug.
+
+### Receiver examples
+
+Working templates in [`examples/`](examples/). Same contract, four runtimes:
+
+- **[`lambda_receiver.py`](examples/lambda_receiver.py)** — AWS Lambda
+  behind API Gateway → DynamoDB. Zero-ops serverless pattern.
+- **[`flask_mysql_receiver.py`](examples/flask_mysql_receiver.py)** —
+  Flask + PyMySQL → MySQL. Classic setup.
+- **[`node_postgres_receiver.js`](examples/node_postgres_receiver.js)** —
+  Node.js + Express + `pg` → Postgres. Shows the producer is
+  language-agnostic.
+- **[`php_mysql_receiver.php`](examples/php_mysql_receiver.php)** —
+  single-file PHP + PDO → MySQL. Drop into any LAMP host.
+
+All follow the same recipe:
+
+1. Check `Authorization: Bearer <token>` against your expected value.
+2. Parse the JSON body.
+3. Switch on `event`: `call.upserted` → upsert by `uuid`;
+   `transcript.upserted` → update the row.
+4. Return `200 OK`.
+
+Pick the columns you care about from the top-level fields (`from`, `to`,
+`duration`, `from_caller_name`, `status`, `transcript.text`), and stash
+the rest in a JSON column via `raw` if you want to query it later.
+
+### Cookbook — useful consumer queries
+
+```sql
+-- Call volume by day, last 30 days
+SELECT DATE(call_time) AS day, COUNT(*) AS calls
+  FROM calls WHERE call_time > NOW() - INTERVAL 30 DAY
+ GROUP BY day ORDER BY day DESC;
+
+-- Full-text search across transcripts (MySQL 5.7+)
+ALTER TABLE calls ADD FULLTEXT INDEX transcript_ft (transcript_text);
+SELECT uuid, call_time, from_caller_name, transcript_text
+  FROM calls
+ WHERE MATCH(transcript_text) AGAINST('invoice overdue' IN NATURAL LANGUAGE MODE);
+
+-- Top callers this week
+SELECT from_number, from_caller_name, COUNT(*) AS n, SUM(duration) AS total_sec
+  FROM calls WHERE call_time > NOW() - INTERVAL 7 DAY AND direction='in'
+ GROUP BY from_number ORDER BY n DESC LIMIT 20;
+
+-- Long voicemails that never got called back (join with your outbound side)
+SELECT call_time, from_caller_name, duration, transcript_text
+  FROM calls
+ WHERE status = 'voicemail' AND duration > 30
+   AND from_number NOT IN (SELECT to_number FROM calls WHERE direction = 'out')
+ ORDER BY call_time DESC;
+```

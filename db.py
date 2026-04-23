@@ -23,7 +23,9 @@ CREATE TABLE IF NOT EXISTS calls (
     quality_score           INTEGER,
     to_smart_attendant_title TEXT,
     raw                     TEXT NOT NULL,
-    first_seen              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    first_seen              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    pushed_at               TEXT,
+    push_error              TEXT
 );
 
 CREATE INDEX IF NOT EXISTS calls_time_idx ON calls(time DESC);
@@ -33,15 +35,31 @@ CREATE TABLE IF NOT EXISTS transcripts (
     text        TEXT NOT NULL,
     source      TEXT NOT NULL,     -- 'native' | 'whisper' | 'faster-whisper'
     model       TEXT,              -- whisper model name, NULL for native
-    created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    pushed_at   TEXT,
+    push_error  TEXT
 );
 """
+
+# Idempotent migrations for DBs created before these columns existed.
+MIGRATIONS = [
+    "ALTER TABLE calls       ADD COLUMN pushed_at  TEXT",
+    "ALTER TABLE calls       ADD COLUMN push_error TEXT",
+    "ALTER TABLE transcripts ADD COLUMN pushed_at  TEXT",
+    "ALTER TABLE transcripts ADD COLUMN push_error TEXT",
+]
 
 
 def connect(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    for sql in MIGRATIONS:
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    conn.commit()
     return conn
 
 
@@ -134,4 +152,68 @@ def stats(conn: sqlite3.Connection) -> dict:
             "SELECT COUNT(*) FROM transcripts"
         ).fetchone()[0],
         "pending": len(calls_needing_transcript(conn)),
+        "unpushed_calls": conn.execute(
+            "SELECT COUNT(*) FROM calls WHERE pushed_at IS NULL"
+        ).fetchone()[0],
+        "unpushed_transcripts": conn.execute(
+            "SELECT COUNT(*) FROM transcripts WHERE pushed_at IS NULL"
+        ).fetchone()[0],
     }
+
+
+def unpushed_calls(conn: sqlite3.Connection, limit: int = 50) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        """SELECT c.*, t.text AS transcript_text, t.source AS transcript_source,
+                  t.model AS transcript_model, t.created_at AS transcript_created_at
+             FROM calls c LEFT JOIN transcripts t USING (uuid)
+            WHERE c.pushed_at IS NULL
+         ORDER BY c.time ASC
+            LIMIT ?""",
+        (limit,),
+    ))
+
+
+def unpushed_transcripts(conn: sqlite3.Connection, limit: int = 50) -> list[sqlite3.Row]:
+    """Transcripts that arrived after their call was already pushed — push updates."""
+    return list(conn.execute(
+        """SELECT t.*, c.time AS call_time
+             FROM transcripts t JOIN calls c USING (uuid)
+            WHERE t.pushed_at IS NULL AND c.pushed_at IS NOT NULL
+         ORDER BY c.time ASC
+            LIMIT ?""",
+        (limit,),
+    ))
+
+
+def mark_call_pushed(conn: sqlite3.Connection, uuids: list[str]) -> None:
+    if not uuids: return
+    with tx(conn):
+        conn.executemany(
+            "UPDATE calls SET pushed_at = CURRENT_TIMESTAMP, push_error = NULL WHERE uuid = ?",
+            [(u,) for u in uuids],
+        )
+
+
+def mark_transcript_pushed(conn: sqlite3.Connection, uuids: list[str]) -> None:
+    if not uuids: return
+    with tx(conn):
+        conn.executemany(
+            "UPDATE transcripts SET pushed_at = CURRENT_TIMESTAMP, push_error = NULL WHERE uuid = ?",
+            [(u,) for u in uuids],
+        )
+
+
+def mark_push_error(conn: sqlite3.Connection, table: str, uuid: str, err: str) -> None:
+    assert table in ("calls", "transcripts")
+    with tx(conn):
+        conn.execute(f"UPDATE {table} SET push_error = ? WHERE uuid = ?", (err[:500], uuid))
+
+
+def recordings_to_prune(conn: sqlite3.Connection, older_than_days: int) -> list[str]:
+    """Return UUIDs whose calls are older than N days — MP3s for these can be deleted."""
+    return [r[0] for r in conn.execute(
+        """SELECT uuid FROM calls
+            WHERE recording = 1
+              AND time < datetime('now', ?)""",
+        (f"-{older_than_days} days",),
+    )]

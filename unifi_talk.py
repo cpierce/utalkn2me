@@ -227,13 +227,47 @@ def cmd_sync(client: UniFiClient, args) -> int:
             db.save_transcript(conn, uuid, text, source=source, model=args.whisper_model)
             print(f"  ✓ {uuid}  {source}  ({len(text)} chars)")
 
+    if args.prune_recordings_days > 0:
+        pruned = _prune_recordings(conn, args.recordings_dir, args.prune_recordings_days)
+        if pruned:
+            print(f"[sync] pruned {pruned} MP3s older than {args.prune_recordings_days} days")
+
     s = db.stats(conn)
     print(f"[sync] stats: {s}")
     return 0
 
 
+def _prune_recordings(conn, rec_dir: str, days: int) -> int:
+    """Delete MP3s for calls older than N days. Keeps DB rows; only audio is removed."""
+    pruned = 0
+    for uuid in db.recordings_to_prune(conn, days):
+        path = os.path.join(rec_dir, f"{uuid}.mp3")
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                pruned += 1
+            except OSError:
+                pass
+    return pruned
+
+
 def cmd_info(client: UniFiClient, args) -> int:
     print(json.dumps(client.info(), indent=2))
+    return 0
+
+
+def cmd_clean_transcripts(client: UniFiClient, args) -> int:
+    """Re-apply the filler/hallucination cleaner to every stored transcript."""
+    conn = db.connect(args.db)
+    rows = list(conn.execute("SELECT uuid, text FROM transcripts"))
+    changed = 0
+    for row in rows:
+        new = tx.clean_transcript(row["text"])
+        if new != row["text"]:
+            conn.execute("UPDATE transcripts SET text = ? WHERE uuid = ?", (new, row["uuid"]))
+            changed += 1
+    conn.commit()
+    print(f"[clean] {changed}/{len(rows)} transcripts updated")
     return 0
 
 
@@ -285,6 +319,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument("--whisper-backend", default=os.environ.get("WHISPER_BACKEND", "auto"),
                         choices=["auto", "faster-whisper", "whisper"])
     p_sync.add_argument("--recordings-dir", default="data/recordings")
+    p_sync.add_argument("--prune-recordings-days",
+                        type=int,
+                        default=int(os.environ.get("PRUNE_RECORDINGS_DAYS", "30")),
+                        help="delete MP3s for calls older than N days (0 disables; default 30)")
     p_sync.set_defaults(func=cmd_sync)
 
     p_list = sub.add_parser("list", help="print calls (no DB)")
@@ -295,6 +333,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_info = sub.add_parser("info", help="dump /proxy/talk/api/info")
     p_info.set_defaults(func=cmd_info)
 
+    p_clean = sub.add_parser("clean-transcripts",
+                             help="re-apply filler/hallucination cleaner to stored transcripts")
+    p_clean.add_argument("--db", default="data/calls.db")
+    p_clean.set_defaults(func=cmd_clean_transcripts, offline=True)
+
     return p
 
 
@@ -304,11 +347,15 @@ def main() -> int:
         build_parser().print_help(); return 2
 
     session_file = os.environ.get("SESSION_FILE", "data/session.json")
+    needs_login = not getattr(args, "offline", False)
     while True:
         try:
-            creds = load_creds()
-            client = UniFiClient(creds, session_file=session_file)
-            client.login()
+            if needs_login:
+                creds = load_creds()
+                client = UniFiClient(creds, session_file=session_file)
+                client.login()
+            else:
+                client = None
             rc = args.func(client, args)
         except Exception as e:
             print(f"[error] {e}", file=sys.stderr)

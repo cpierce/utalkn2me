@@ -1,4 +1,4 @@
-.PHONY: help build up down restart logs logs-worker logs-api ps sh-worker sh-api shell stats sync clean wipe
+.PHONY: help build up down restart logs logs-worker logs-api logs-pusher ps sh-worker sh-api sh-pusher shell stats sync last clean wipe
 
 # Default to `op run` so 1Password resolves op:// refs in .env on the host.
 # Override with `OP= make up` if you want to pass plain values yourself.
@@ -14,10 +14,13 @@ help:
 	@echo "  make logs        follow logs from both services"
 	@echo "  make logs-worker follow worker logs only"
 	@echo "  make logs-api    follow api logs only"
+	@echo "  make logs-pusher follow pusher logs only"
 	@echo "  make ps          show container status"
 	@echo "  make sh-worker   shell into the worker container"
 	@echo "  make sh-api      shell into the api container"
+	@echo "  make sh-pusher   shell into the pusher container"
 	@echo "  make stats       GET /stats from the running API"
+	@echo "  make last        show the most recent call + transcript"
 	@echo "  make sync        run one sync cycle in a throwaway container"
 	@echo "  make wipe        DANGER: rm -rf ./data (drops DB, recordings)"
 
@@ -41,6 +44,9 @@ logs-worker:
 logs-api:
 	docker compose logs -f api
 
+logs-pusher:
+	docker compose logs -f pusher
+
 ps:
 	docker compose ps
 
@@ -50,8 +56,14 @@ sh-worker:
 sh-api:
 	docker compose exec api /bin/bash
 
+sh-pusher:
+	docker compose exec pusher /bin/bash
+
 stats:
 	@curl -s http://127.0.0.1:$${API_PORT:-8000}/stats | python3 -m json.tool
+
+last:
+	@curl -s 'http://127.0.0.1:$${API_PORT:-8000}/calls?limit=1' | python3 -m json.tool
 
 sync:
 	$(OP) docker compose run --rm worker sync --transcribe \
