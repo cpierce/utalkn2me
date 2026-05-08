@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from urllib.parse import urljoin, unquote
+from urllib.parse import urljoin
 
 import requests
 import urllib3
@@ -27,26 +27,11 @@ class Creds:
     host: str
     username: str
     password: str
-    totp_ref: str | None = None
-    totp: str | None = None
+    totp_secret: str | None = None
 
 
 def op_read(ref: str) -> str:
     r = subprocess.run(["op", "read", ref], capture_output=True, text=True, check=True)
-    return r.stdout.strip()
-
-
-def op_totp(ref: str) -> str:
-    if not ref.startswith("op://"):
-        raise ValueError(f"not a 1Password ref: {ref}")
-    parts = ref[len("op://"):].split("/")
-    if len(parts) < 2:
-        raise ValueError(f"ref must be op://<vault>/<item>[/<field>]: {ref}")
-    vault, item = unquote(parts[0]), unquote(parts[1])
-    r = subprocess.run(
-        ["op", "item", "get", item, "--vault", vault, "--otp"],
-        capture_output=True, text=True, check=True,
-    )
     return r.stdout.strip()
 
 
@@ -62,18 +47,13 @@ def load_creds() -> Creds:
     host = os.environ.get("UNIFI_HOST", "https://192.168.1.1")
     user = os.environ.get("UNIFI_USER_REF") or os.environ.get("UNIFI_USER")
     pw = os.environ.get("UNIFI_PASS_REF") or os.environ.get("UNIFI_PASS")
-    # UNIFI_TOTP_REF points to a 1P ref (for host-side `op` use).
-    # UNIFI_TOTP is a literal 6-digit code (for `op run` style injection).
-    totp_ref = os.environ.get("UNIFI_TOTP_REF")
-    totp = os.environ.get("UNIFI_TOTP")
     if not user or not pw:
         raise SystemExit("Set UNIFI_USER(_REF) and UNIFI_PASS(_REF)")
     return Creds(
         host=host.rstrip("/"),
         username=_resolve(user),
         password=_resolve(pw),
-        totp_ref=totp_ref,
-        totp=totp,
+        totp_secret=os.environ.get("UNIFI_TOTP_SECRET"),
     )
 
 
@@ -119,6 +99,12 @@ class UniFiClient:
         with open(self.session_file, "w") as f:
             json.dump(data, f)
 
+    def _current_totp(self) -> str | None:
+        if not self.creds.totp_secret:
+            return None
+        import pyotp
+        return pyotp.TOTP(self.creds.totp_secret).now()
+
     def login(self) -> None:
         if self._load_session():
             return  # reused persisted session
@@ -127,8 +113,7 @@ class UniFiClient:
             "password": self.creds.password,
             "rememberMe": False,
         }
-        # TOTP: literal wins over ref (literal is fresher).
-        totp = self.creds.totp or (op_totp(self.creds.totp_ref) if self.creds.totp_ref else None)
+        totp = self._current_totp()
         if totp:
             body["token"] = totp
         r = self.session.post(
@@ -138,7 +123,7 @@ class UniFiClient:
         )
         if r.status_code == 499:
             raise SystemExit(
-                "MFA required. Pass UNIFI_TOTP (6-digit code) or UNIFI_TOTP_REF."
+                "MFA required. Set UNIFI_TOTP_SECRET to the BASE32 shared secret."
             )
         r.raise_for_status()
         self.csrf = r.headers.get("X-CSRF-Token") or r.headers.get("X-Updated-CSRF-Token")
