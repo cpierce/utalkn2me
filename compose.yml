@@ -30,9 +30,9 @@ services:
       HEARTBEAT_FILE: /data/.worker-heartbeat
     volumes:
       - ./data:/data
-    # Heartbeat is touched every loop iteration and every transcription item,
-    # so 30 min of silence means a wedged worker — a long backlog churn that
-    # is still making progress never trips this.
+    # Heartbeat is touched after every successful cycle and every transcription
+    # item, so 30 min of silence means the worker is wedged OR failing every
+    # cycle (auth/network) — either way it should read unhealthy, not "Up".
     healthcheck:
       test: ["CMD", "python", "-c", "import os,sys,time; p='/data/.worker-heartbeat'; sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p) < 1800 else 1)"]
       interval: 60s

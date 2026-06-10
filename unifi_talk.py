@@ -430,7 +430,6 @@ def main() -> int:
     session_file = os.environ.get("SESSION_FILE", "data/session.json")
     needs_login = not getattr(args, "offline", False)
     while True:
-        beat()
         try:
             if needs_login:
                 creds = load_creds()
@@ -448,7 +447,11 @@ def main() -> int:
             rc = 1
         if not args.loop:
             return rc
-        beat()
+        # Only successful cycles beat: a worker that loops on auth/network
+        # errors must go unhealthy, not look alive (per-item beats during a
+        # long transcription backlog still count as progress).
+        if rc == 0:
+            beat()
         print(f"[loop] sleeping {args.loop}s…")
         time.sleep(args.loop)
 
