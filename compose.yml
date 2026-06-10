@@ -1,8 +1,23 @@
+# Hardening defaults shared by every service:
+#  - init: docker-init as PID 1 forwards SIGTERM, so `docker stop` is clean
+#    (exit 0/143) instead of hanging 10s and SIGKILLing (exit 137).
+#  - restart: always — unlike unless-stopped, containers killed during a
+#    Docker Desktop shutdown/restart come back when the daemon does.
+#  - log rotation so weeks of loop output can't fill the disk.
+x-hardening: &hardening
+  init: true
+  restart: always
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
   worker:
+    <<: *hardening
     build: .
     container_name: utalkn2me-worker
-    restart: unless-stopped
     environment:
       UNIFI_HOST:  ${UNIFI_HOST:-https://192.168.1.1}
       UNIFI_USER:  ${UNIFI_USER}
@@ -12,14 +27,24 @@ services:
       WHISPER_MODEL:    ${WHISPER_MODEL:-large-v3}
       TRANSCRIPT_CLEAN: ${TRANSCRIPT_CLEAN:-1}
       PRUNE_RECORDINGS_DAYS: ${PRUNE_RECORDINGS_DAYS:-30}
+      HEARTBEAT_FILE: /data/.worker-heartbeat
     volumes:
       - ./data:/data
+    # Heartbeat is touched every loop iteration and every transcription item,
+    # so 30 min of silence means a wedged worker — a long backlog churn that
+    # is still making progress never trips this.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; p='/data/.worker-heartbeat'; sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p) < 1800 else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 5m
     # entrypoint + default CMD from Dockerfile run the sync loop
 
   pusher:
+    <<: *hardening
     build: .
     container_name: utalkn2me-pusher
-    restart: unless-stopped
     entrypoint: ["python", "push.py"]
     environment:
       SQLITE_PATH:    /data/calls.db
@@ -29,8 +54,15 @@ services:
       PUSH_BATCH:     ${PUSH_BATCH:-10}
       PUSH_INTERVAL:  ${PUSH_INTERVAL:-5}
       PUSH_TIMEOUT:   ${PUSH_TIMEOUT:-30}
+      HEARTBEAT_FILE: /data/.pusher-heartbeat
     volumes:
       - ./data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; p='/data/.pusher-heartbeat'; sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p) < 300 else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 2m
     depends_on:
       - worker
 
@@ -38,9 +70,9 @@ services:
   # Opt-in via the `api` profile:  make up-api  (or: docker compose --profile api up)
   # Bind host defaults to 127.0.0.1 — set API_BIND=0.0.0.0 to expose on your LAN.
   api:
+    <<: *hardening
     build: .
     container_name: utalkn2me-api
-    restart: unless-stopped
     profiles: ["api"]
     entrypoint: ["gunicorn", "-b", "0.0.0.0:8000", "--workers", "1", "--timeout", "120", "api:app"]
     environment:

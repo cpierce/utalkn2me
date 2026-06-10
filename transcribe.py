@@ -110,13 +110,20 @@ def _whisper_cli(mp3_path: str, model: str = "tiny") -> str:
         return f.read().strip()
 
 
+# Loaded models, keyed by name. large-v3 is ~GBs off disk — reloading it for
+# every call is slow and churns enough memory to invite the OOM killer.
+_FW_MODELS: dict[str, object] = {}
+
+
 def _faster_whisper(mp3_path: str, model: str = "tiny") -> str:
     """Use faster-whisper (CTranslate2). Smaller model on disk, CPU-fast."""
     try:
         from faster_whisper import WhisperModel
     except ImportError:
         raise TranscribeError("faster-whisper not installed")
-    fw_model = WhisperModel(model, device="cpu", compute_type="int8")
+    fw_model = _FW_MODELS.get(model)
+    if fw_model is None:
+        fw_model = _FW_MODELS[model] = WhisperModel(model, device="cpu", compute_type="int8")
     segments, _ = fw_model.transcribe(mp3_path, language="en", beam_size=1)
     return " ".join(s.text.strip() for s in segments).strip()
 

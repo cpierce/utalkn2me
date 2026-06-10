@@ -51,8 +51,14 @@ MIGRATIONS = [
 
 
 def connect(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
+    # Worker, pusher, and API share this file across containers. WAL lets
+    # readers and the writer coexist; busy_timeout waits out short contention
+    # instead of raising "database is locked".
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.executescript(SCHEMA)
     for sql in MIGRATIONS:
         try:

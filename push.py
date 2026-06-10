@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import sys
 import time
@@ -26,6 +27,19 @@ import db
 
 SCHEMA_VERSION = 1
 USER_AGENT = f"utalkn2me/{SCHEMA_VERSION} ({socket.gethostname()})"
+
+HEARTBEAT_FILE = os.environ.get("HEARTBEAT_FILE", "")
+
+
+def beat() -> None:
+    if not HEARTBEAT_FILE:
+        return
+    try:
+        with open(HEARTBEAT_FILE, "a"):
+            pass
+        os.utime(HEARTBEAT_FILE, None)
+    except OSError:
+        pass
 
 
 def _payload_for_call(row) -> dict:
@@ -135,6 +149,10 @@ def run_once(conn, *, url: str, token: str | None, batch: int, timeout: int) -> 
 
 
 def main() -> int:
+    # As container PID 1, Python ignores SIGTERM by default — handle it so
+    # `docker stop` exits cleanly instead of timing out into SIGKILL (137).
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
     url = os.environ.get("PUSH_URL")
     token = os.environ.get("PUSH_TOKEN")
     batch = int(os.environ.get("PUSH_BATCH", "10"))
@@ -146,15 +164,27 @@ def main() -> int:
         print("[push] PUSH_URL not set — pusher idling. "
               "Set it to enable webhook delivery.", flush=True)
         while True:
+            beat()
             time.sleep(60)
 
     print(f"[push] pushing to {url}  batch={batch}  interval={interval}s", flush=True)
     conn = db.connect(db_path)
     while True:
+        beat()
         try:
             run_once(conn, url=url, token=token, batch=batch, timeout=timeout)
         except Exception as e:
             print(f"[push] loop error: {e}", flush=True)
+            # A broken connection (e.g. disk hiccup on the bind mount) would
+            # otherwise fail every cycle forever — reconnect and carry on.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                conn = db.connect(db_path)
+            except Exception as e2:
+                print(f"[push] reconnect failed: {e2}", flush=True)
         time.sleep(interval)
 
 
